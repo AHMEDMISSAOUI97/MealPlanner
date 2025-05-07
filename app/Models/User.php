@@ -18,8 +18,23 @@ class User extends Authenticatable implements MustVerifyEmail
      * @var array<int, string>
      */
     protected $fillable = [
-        'name', 'email', 'password', 'age', 'height', 'weight', 
-        'goal', 'preferred_cuisine', 'allergies', 'provider', 'provider_id'
+        'name', 
+        'email', 
+        'gender' , 
+        'password', 
+        'age', 
+        'height', 
+        'weight', 
+        'goal', 
+        'preferred_cuisine', 
+        'allergies', 
+        'provider', 
+        'provider_id',
+        'daily_calories',
+        'daily_protein',
+        'daily_carbs',
+        'daily_fat',
+        'activity_level',
     ];
 
     /**
@@ -42,4 +57,8 @@ class User extends Authenticatable implements MustVerifyEmail
         'password' => 'hashed',
         'allergies' => 'array',
     ];
+
+    public function meals() {
+        return $this->hasMany(Meal::class);
+    }
 }

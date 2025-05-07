@@ -4,6 +4,10 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
+use App\Models\Meal;
+use Illuminate\Support\Facades\Storage;
 
 class AIController extends Controller
 {
@@ -216,5 +220,193 @@ class AIController extends Controller
             }
         }
         return 0;
+    }
+
+    public function getMealFromOpenAI(Request $request)
+    {
+        $user = $request->user();
+
+        // Fallback to user profile values if not present in request
+        $gender = $request->input('gender', $user->gender);
+        $age = $request->input('age', $user->age);
+        $height = $request->input('height', $user->height);
+        $weight = $request->input('weight', $user->weight);
+        $goal = $request->input('goal', $user->goal);
+        $preferred_cuisine = $request->input('preferred_cuisine', $user->preferred_cuisine);
+        $allergies = $request->input('allergies', $user->allergies ?? []);
+
+        // Explicitly required from the user input
+        $request->validate([
+            'meal_type' => 'required|string|in:breakfast,lunch,dinner,snack,post_workout,pre_workout',
+            'calories' => 'required|integer|min:100',
+            'protein' => 'required|integer|min:0',
+            'carbs' => 'required|integer|min:0',
+            'ingredients' => 'required|array|min:1',
+        ]);
+
+        $mealType = $request->meal_type;
+        $ingredients = implode(", ", $request->ingredients);
+        $calories = $request->calories;
+        $protein = $request->protein;
+        $carbs = $request->carbs;
+
+        $openaiApiKey = config('services.openai.key');
+        $endpoint = 'https://api.openai.com/v1/chat/completions';
+        
+        $promptTemplate = <<<EOT
+        I need a meal plan suggestion based on these precise requirements:
+
+        ### 🔹 User Information
+        - Gender: {{gender}}
+        - Age: {{age}} years
+        - Height: {{height}} cm
+        - Weight: {{weight}} kg
+        - Goal: {{goal}}
+        - Meal Type: {{meal_type}} (The meal must be suitable for this type)
+
+        ### 🔹 Macronutrient Goals
+        - Target Calories: {{calories}} kcal
+        - Target Protein: {{protein}} g
+        - Target Carbohydrates: {{carbs}} g
+        - Fat should be adjusted dynamically to balance macros.
+
+        ### 🔹 Allowed Ingredients
+        Prioritize these ingredients: {{ingredients}}
+
+        ### 🔹 Smart Ingredient Selection Rules
+        - The meal must strictly align with the meal type: {{meal_type}}. Adjust ingredients, cooking style, and portion sizes accordingly.
+        - Use ONLY ingredients that help reach the calorie and macronutrient targets.
+        - Remove ingredients that do not significantly contribute to macros.
+        - If necessary, ADD new ingredients to improve balance.
+        - Portion sizes should be adjusted to stay within ±5% of the target macros.
+
+        ### 🔹 Macronutrient Integrity
+        - Macronutrient values must reflect **real values from reliable nutritional databases like USDA**.
+        - Each ingredient must indicate its **preparation state** (e.g., raw, cooked, grilled, steamed).
+        - NEVER alter protein, fat, or carb values just to match the targets.
+        - If nutritional goals aren’t met, adjust quantities or swap ingredients — but DO NOT fabricate macros.
+
+        ### 🔹 Cooking Instructions
+        - Provide clear, structured cooking steps.
+        - Include preparation time, cooking time, and method (e.g., baking, grilling, steaming).
+        - Make it beginner-friendly with easy-to-follow steps.
+
+        ### 🔹 IMPORTANT RULES
+        1️⃣ STRICTLY return only a valid JSON object. No markdown, no explanations, no formatting.  
+        2️⃣ Ensure all meals include detailed macronutrient breakdowns **per ingredient**, with quantities and cooking states.  
+        3️⃣ The final response format must **exactly match** the example JSON below:
+
+        {"meal": {
+        "name": "Grilled Meat & Potato Bowl",
+        "calories": 500,
+        "protein": 60,
+        "carbs": 40,
+        "fat": 30,
+        "ingredients": [
+            {"name": "Beef (grilled)", "quantity": "150g", "calories": 300, "protein": 50, "carbs": 0, "fat": 18},
+            {"name": "Olive Oil", "quantity": "2 tbsp", "calories": 240, "protein": 0, "carbs": 0, "fat": 28},
+            {"name": "Potatoes (roasted)", "quantity": "150g", "calories": 130, "protein": 3, "carbs": 30, "fat": 0.2},
+            {"name": "Tomato (fresh)", "quantity": "1 medium", "calories": 25, "protein": 1, "carbs": 5, "fat": 0.2}
+        ],
+        "instructions": [
+            "Preheat oven to 400°F (200°C).",
+            "Season beef with salt and pepper. Grill or pan-fry for 5-7 minutes per side.",
+            "Cut potatoes into wedges, drizzle with 1 tbsp olive oil, and roast for 25-30 minutes.",
+            "Slice tomato and set aside.",
+            "Drizzle remaining olive oil over meat and potatoes before serving.",
+            "Serve all components together in a bowl."
+        ]}}
+        EOT;
+        
+                $prompt = str_replace(
+                    ['{{gender}}', '{{age}}', '{{height}}', '{{weight}}', '{{goal}}', '{{meal_type}}', '{{calories}}', '{{protein}}', '{{carbs}}', '{{ingredients}}'],
+                    [$gender, $age, $height, $weight, $goal, $mealType, $calories, $protein, $carbs, $ingredients],
+                    $promptTemplate
+                );
+        
+                $response = Http::withHeaders([
+                    'Authorization' => 'Bearer ' . $openaiApiKey,
+                    'Content-Type' => 'application/json',
+                ])->post($endpoint, [
+                    'model' => 'gpt-4o',
+                    'messages' => [
+                        ['role' => 'user', 'content' => $prompt]
+                    ],
+                    'temperature' => 0.7,
+                ]);
+        
+        $data = $response->json();
+
+        Log::info("OpenAI Response:", $data);
+
+        $message = $data['choices'][0]['message']['content'] ?? null;
+        if (!$message) {
+            return response()->json(['error' => 'Invalid AI response'], 500);
+        }
+
+        $cleaned = preg_replace('/```json|```/', '', $message);
+        $parsed = json_decode(trim($cleaned), true);
+
+        if (!$parsed) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Failed to parse OpenAI response into valid JSON.',
+                'raw' => $message
+            ], 500);
+        }
+
+        // **Now generate the image based on the meal name and ingredients**
+        $mealName = $parsed['meal']['name'];
+        $ingredients = implode(", ", array_map(function ($ingredient) {
+            return $ingredient['name'];
+        }, $parsed['meal']['ingredients']));
+
+        $imagePrompt = "Generate a realistic, high-resolution photograph of a freshly prepared meal titled '$mealName', served on a ceramic plate. The dish should be fully cooked and beautifully arranged with the following ingredients: $ingredients. The scene should resemble a professional food photo, styled for a recipe book or restaurant menu. Use natural lighting, slight shadows, and realistic textures — no illustrations, no cartoons, no sketches.";
+        //Log::info("Image Generation Prompt: " . $imagePrompt);
+
+        $imageResponse = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $openaiApiKey,
+            'Content-Type' => 'application/json',
+        ])->post('https://api.openai.com/v1/images/generations', [
+            'prompt' => $imagePrompt,
+            'n' => 2,
+            'size' => '1024x1024'
+        ]);
+
+        $imageData = $imageResponse->json();
+
+        $localUrls = [];
+        if (!empty($imageData['data'])) {
+            foreach ($imageData['data'] as $img) {
+                $url       = $img['url'];
+                $contents  = file_get_contents($url);
+                $path      = 'meals/' . uniqid('meal_') . '.png';
+                Storage::disk('public')->put($path, $contents);
+                $localUrls[] = asset("storage/{$path}");
+            }
+        } else {
+            return response()->json(['error'=>'Failed to generate images'], 500);
+        }
+
+        // Save the meal
+        $meal = new Meal();
+        $meal->user_id = $user->id;
+        $meal->name = $parsed['meal']['name'];
+        $meal->meal_type = $mealType;
+        $meal->ingredients = json_encode($parsed['meal']['ingredients']);
+        $meal->instructions = json_encode($parsed['meal']['instructions']);
+        $meal->calories = $parsed['meal']['calories'];
+        $meal->protein = $parsed['meal']['protein'];
+        $meal->carbs = $parsed['meal']['carbs'];
+        $meal->fat = $parsed['meal']['fat'];
+        $meal->images = $localUrls;
+        $meal->save();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Meal successfully generated and stored.',
+            'meal_plan' => $parsed,
+            'images_link' => $localUrls,
+        ], 200, [], JSON_UNESCAPED_SLASHES);
     }
 }

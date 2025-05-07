@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AIController;
+use App\Http\Controllers\MealAnalysisController;
 use App\Http\Controllers\Auth\VerifyEmailController;
 use App\Http\Controllers\AuthController;
 use Illuminate\Foundation\Auth\EmailVerificationRequest;
@@ -20,6 +21,7 @@ use Illuminate\Support\Facades\Route;
 
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
+Route::post('/analyze-meal', [MealAnalysisController::class, 'analyzeMeal']);
 
 Route::get('/email/verify/{id}/{hash}', function (EmailVerificationRequest $request) {
     $request->fulfill(); 
@@ -38,4 +40,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/update-profile', [AuthController::class, 'updateProfile']);
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::post('/ai-meal', [AIController::class, 'getMealSuggestion']);
+    Route::post('/ai-meal/openai', [AIController::class, 'getMealFromOpenAI']);
+    //Route::post('/analyze-meal', [MealAnalysisController::class, 'analyzeMeal']);
 });
