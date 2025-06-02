@@ -39,7 +39,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/users', [AuthController::class, 'getAllUsers']); 
     Route::post('/update-profile', [AuthController::class, 'updateProfile']);
     Route::post('/logout', [AuthController::class, 'logout']);
-    Route::post('/ai-meal', [AIController::class, 'getMealSuggestion']);
+    Route::post('/ai-meal/gemini', [AIController::class, 'getMealSuggestion']);
     Route::post('/ai-meal/openai', [AIController::class, 'getMealFromOpenAI']);
     //Route::post('/analyze-meal', [MealAnalysisController::class, 'analyzeMeal']);
+    Route::get('/meals', [AuthController::class, 'getUserMeals']);
+    Route::post('/favorites/{meal_id}', [AuthController::class, 'toggleFavorite']);
+    Route::get('/favorites', [AuthController::class, 'getFavorites']);
 });

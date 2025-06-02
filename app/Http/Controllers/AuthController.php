@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use App\Models\Meal;
 use Illuminate\Auth\Events\Registered;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -91,13 +92,23 @@ class AuthController extends Controller
             'message' => 'Login successful.',
             'access_token' => $token,
             'token_type' => 'Bearer',
-        ]);
+        ],200);
     }
 
     // Get User Profile
     public function profile(Request $request)
     {
-        return response()->json($request->user());
+        $user = $request->user();
+        $userData = $user->toArray();
+    
+        // Handle allergies field: decode only if it's a JSON string
+        if (isset($userData['allergies']) && is_string($userData['allergies'])) {
+            $userData['allergies'] = json_decode($userData['allergies'], true) ?? [];
+        } else {
+            $userData['allergies'] = $userData['allergies'] ?? [];
+        }
+    
+        return response()->json($userData); 
     }
 
     // Return a specified user by ID
@@ -166,6 +177,17 @@ class AuthController extends Controller
 
         $user->fill($data)->save();
 
+        // Recalculate daily targets after updating user fields
+        $macros = MacroCalculator::calculate([
+            'gender' => $user->gender,
+            'age' => $user->age,
+            'height' => $user->height,
+            'weight' => $user->weight,
+            'goal' => $user->goal,
+            'activity_level' => $user->activity_level,
+        ]);
+        $user->update($macros);
+
         if ($triggerEmailVerification) {
             event(new Registered($user)); // Triggers email
         }
@@ -179,7 +201,8 @@ class AuthController extends Controller
 
         return response()->json([
             'message' => 'Profile updated successfully',
-            'user' => $user
+            'user' => $user,
+            'daily_targets' => $macros
         ]);
     }
 
@@ -188,5 +211,38 @@ class AuthController extends Controller
     {
         $request->user()->tokens()->delete();
         return response()->json(['message' => 'Logged out']);
+    }
+
+    public function getUserMeals(Request $request)
+    {
+        $user = $request->user();
+        $meals = $user->meals()->get();
+        return response()->json($meals);
+    }
+
+    public function toggleFavorite(Request $request, $mealId)
+    {
+        $user = $request->user();
+        $meal = Meal::findOrFail($mealId);
+
+        // Check if the meal is already favorited
+        $isFavorited = $user->favorites()->where('meal_id', $mealId)->exists();
+
+        if ($isFavorited) {
+            // Remove from favorites
+            $user->favorites()->detach($mealId);
+            return response()->json(['message' => 'Meal removed from favorites']);
+        } else {
+            // Add to favorites
+            $user->favorites()->attach($mealId);
+            return response()->json(['message' => 'Meal added to favorites']);
+        }
+    }
+
+    public function getFavorites(Request $request)
+    {
+        $user = $request->user();
+        $favorites = $user->favorites()->get();
+        return response()->json($favorites);
     }
 }

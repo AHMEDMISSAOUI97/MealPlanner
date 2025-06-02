@@ -271,20 +271,30 @@ class AIController extends Controller
         - Fat should be adjusted dynamically to balance macros.
 
         ### 🔹 Allowed Ingredients
-        Prioritize these ingredients: {{ingredients}}
+        Ingredients are provided in this format: {{ingredients}} (e.g., ["100 gramme chicken breast", "3 tomatoes", "200 gramme tuna"]). Each entry includes quantity, unit, and ingredient name.
+
+        ### 🔹 Ingredient Processing Rules
+        - Parse each ingredient string to extract the quantity, unit, and name (e.g., "100 gramme chicken breast" → quantity: 100, unit: gramme, name: chicken breast).
+        - For each ingredient, fetch its macronutrient data from the USDA FoodData Central database based on the name and preparation state (assume "raw" unless specified, e.g., "chicken breast" is raw, "pasta" is cooked).
+        - Convert quantities to grams if needed (e.g., "20ml olive oil" → ~18g, "2 medium tomatoes" → ~246g, "1 baguette" → ~150g). Use standard conversions (e.g., 1 medium tomato ≈ 123g, 1ml olive oil ≈ 0.91g).
+        - Calculate macros for each ingredient based on the quantity (e.g., 100g chicken breast → 165 kcal, 31g protein, 0g carbs, 3.6g fat).
 
         ### 🔹 Smart Ingredient Selection Rules
         - The meal must strictly align with the meal type: {{meal_type}}. Adjust ingredients, cooking style, and portion sizes accordingly.
-        - Use ONLY ingredients that help reach the calorie and macronutrient targets.
-        - Remove ingredients that do not significantly contribute to macros.
-        - If necessary, ADD new ingredients to improve balance.
-        - Portion sizes should be adjusted to stay within ±5% of the target macros.
+        - Use ALL provided ingredients unless they cannot fit within the macro goals after scaling.
+        - Iteratively scale the quantities of each ingredient (up or down) to meet the macro goals within ±5% (e.g., if 100g pasta exceeds carb target, reduce to 50g).
+        - If scaling alone cannot meet the goals, ADD new ingredients to balance macros (e.g., add chicken breast for protein).
+        - Remove ingredients only if they contribute less than 5% to total macros AND their removal helps meet the goals.
+        - If the final macros deviate by more than ±5% from the target after scaling and adding ingredients, use the actual calculated macros and include a warning in the response.
 
         ### 🔹 Macronutrient Integrity
-        - Macronutrient values must reflect **real values from reliable nutritional databases like USDA**.
+        - Macronutrient values must reflect **real values from the USDA FoodData Central database**.
         - Each ingredient must indicate its **preparation state** (e.g., raw, cooked, grilled, steamed).
-        - NEVER alter protein, fat, or carb values just to match the targets.
-        - If nutritional goals aren’t met, adjust quantities or swap ingredients — but DO NOT fabricate macros.
+        - Calculate the total macros by summing the macros of each ingredient.
+        - STRICTLY FORBID altering protein, fat, carb, or calorie values to match the targets. If the targets cannot be met, return the actual calculated values.
+        - If the final macros deviate from the target by more than ±5%, include a "warning" field in the response explaining the deviation (e.g., "warning": "Protein target not met; actual protein is 40g instead of 51g").
+        - MANDATORY VALIDATION: After generating the meal, calculate the sum of each macro (calories, protein, carbs, fat) from the ingredients. Compare with the reported totals. If any reported total deviates from the sum by more than 0.1%, return: {"error": "Macro fabrication detected; reported totals do not match sum of ingredients. Reported: {reported_values}, Sum: {summed_values}"}, where {reported_values} and {summed_values} are the respective totals.
+        - CRITICAL ENFORCEMENT: Fabrication of macros will invalidate the response. The reported totals MUST be the exact sum of the ingredients' macros, with no exceptions.
 
         ### 🔹 Cooking Instructions
         - Provide clear, structured cooking steps.
@@ -292,9 +302,9 @@ class AIController extends Controller
         - Make it beginner-friendly with easy-to-follow steps.
 
         ### 🔹 IMPORTANT RULES
-        1️⃣ STRICTLY return only a valid JSON object. No markdown, no explanations, no formatting.  
-        2️⃣ Ensure all meals include detailed macronutrient breakdowns **per ingredient**, with quantities and cooking states.  
-        3️⃣ The final response format must **exactly match** the example JSON below:
+        1️⃣ STRICTLY return only a valid JSON object. No markdown, no explanations, no formatting.
+        2️⃣ Ensure all meals include detailed macronutrient breakdowns **per ingredient**, with quantities and cooking states.
+        3️⃣ The final response format must **exactly match** the example JSON below, with a mandatory "warning" field if targets are not met:
 
         {"meal": {
         "name": "Grilled Meat & Potato Bowl",
@@ -302,6 +312,7 @@ class AIController extends Controller
         "protein": 60,
         "carbs": 40,
         "fat": 30,
+        "warning": "Protein target not met; actual protein is 55g instead of 60g", // Mandatory if targets not met
         "ingredients": [
             {"name": "Beef (grilled)", "quantity": "150g", "calories": 300, "protein": 50, "carbs": 0, "fat": 18},
             {"name": "Olive Oil", "quantity": "2 tbsp", "calories": 240, "protein": 0, "carbs": 0, "fat": 28},
