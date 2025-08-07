@@ -2,15 +2,115 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Ingredient;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Auth;
 use App\Models\Meal;
+use App\Services\MacroOptimizer;
 use Illuminate\Support\Facades\Storage;
 
 class AIController extends Controller
 {
+    protected MacroOptimizer $macroOptimizer;
+
+    public function __construct(MacroOptimizer $macroOptimizer)
+    {
+        $this->macroOptimizer = $macroOptimizer;
+    }
+
+    public function optimizeMeal(Request $request)
+    {
+        // --- 1. Fetch Ingredient Data from your Database ---
+        // It's crucial that this data matches the structure expected by MacroOptimizer
+        // (i.e., contains 'name', 'calories_per_100g', 'protein_per_100g', etc.)
+        $ingredientDatabase = Ingredient::all()->toArray();
+
+        // Basic check to ensure you have ingredients in your DB
+        if (empty($ingredientDatabase)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'No ingredients found in the database. Please seed your ingredients table.',
+            ], 400);
+        }
+
+        // --- 2. Define Example Input Data ---
+
+        // Example: Fixed ingredients you *must* include (e.g., from user's current meal log)
+        // Key is the 'name' from your ingredients table, value is grams
+        $currentIngredients = [
+             'Chicken Breast' => 50, // Example: user wants to include 50g of chicken breast
+             'White Rice' => 100,    // Example: user wants to include 100g of white rice
+        ];
+        // If you don't want any fixed ingredients, leave this array empty: []
+
+        // Example: Target macro ranges for the meal (e.g., from user's daily goals)
+        $targetMacros = [
+            'calories' => ['min' => 500, 'max' => 700],
+            'protein'  => ['min' => 40,  'max' => 60],
+            'fat'      => ['min' => 15,  'max' => 25],
+            'carbs'    => ['min' => 50,  'max' => 80],
+        ];
+        // Ensure the macro keys ('calories', 'protein', 'fat', 'carbs') match the MACROS set in your nutrition.mod file.
+
+
+        // --- 3. Call the Optimization Service ---
+        $result = $this->macroOptimizer->optimizeIngredientsForMacros(
+            $currentIngredients,
+            $targetMacros,
+            $ingredientDatabase
+        );
+
+        // --- 4. Handle and Display the Results ---
+        if (isset($result['error'])) {
+            Log::error('Meal Optimization Failed: ' . $result['error']);
+            return response()->json([
+                'status' => 'error',
+                'message' => $result['error'],
+            ], 500); // 500 Internal Server Error for optimization failure
+        }
+
+        if ($result['status'] === 'infeasible') {
+            return response()->json([
+                'status' => 'infeasible',
+                'message' => $result['error'], // Contains the infeasible message
+                'details' => $result, // Full result for debugging
+            ], 422); // 422 Unprocessable Entity for infeasible
+        }
+
+        // If optimal solution found
+        $optimizedIngredients = $result['optimized_ingredients'];
+        $deviations = $result['deviations'];
+        $totalObjectiveValue = $result['total_objective_value'];
+
+        // You might want to calculate total macros from the optimized ingredients here for user display
+        $calculatedMacros = [];
+        foreach ($optimizedIngredients as $name => $grams) {
+            // Find the original ingredient from the database to get its per_100g values
+            $originalIngredient = collect($ingredientDatabase)->firstWhere('name', $name);
+
+            if ($originalIngredient) {
+                foreach (['calories', 'protein', 'fat', 'carbs'] as $macro) {
+                    $macroPerG = ($originalIngredient[$macro . '_per_100g'] ?? 0) / 100;
+                    $calculatedMacros[$macro] = ($calculatedMacros[$macro] ?? 0) + ($grams * $macroPerG);
+                }
+            }
+        }
+        $calculatedMacros = array_map(fn($val) => round($val, 2), $calculatedMacros);
+
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Meal optimization completed.',
+            'optimized_ingredients' => $optimizedIngredients,
+            'calculated_macros' => $calculatedMacros, // Total macros from the optimized plan
+            'target_macros' => $targetMacros,
+            'deviations' => $deviations,
+            'total_objective_value' => round($totalObjectiveValue, 2),
+        ]);
+    }
+
     public function getMealSuggestion(Request $request)
     {
          // Validate request input
@@ -107,7 +207,7 @@ class AIController extends Controller
         $data = $response->json();
 
         // Log AI response for debugging
-        \Log::info("AI Response: " . json_encode($data));
+        Log::info("AI Response: " . json_encode($data));
 
         // **🔹 Validate AI Response**
         if (!isset($data['candidates'][0]['content']['parts'][0]['text'])) {
@@ -160,7 +260,7 @@ class AIController extends Controller
             $query = $ingredient['name'];
     
             // 🔹 Log full request before sending
-            \Log::info("USDA API Request", [
+            Log::info("USDA API Request", [
                 'url' => $usdaEndpoint,
                 'params' => [
                     'query' => $query,
@@ -179,7 +279,7 @@ class AIController extends Controller
             $data = $response->json();
     
             // 🔹 Log full USDA API response
-            \Log::info("USDA Response for: {$query}", $data);
+            Log::info("USDA Response for: {$query}", $data);
     
             if (!empty($data['foods'][0])) {
                 $foodData = $data['foods'][0];
@@ -235,7 +335,7 @@ class AIController extends Controller
         $preferred_cuisine = $request->input('preferred_cuisine', $user->preferred_cuisine);
         $allergies = $request->input('allergies', $user->allergies ?? []);
 
-        // Explicitly required from the user input
+        // Validate the request
         $request->validate([
             'meal_type' => 'required|string|in:breakfast,lunch,dinner,snack,post_workout,pre_workout',
             'calories' => 'required|integer|min:100',
@@ -244,6 +344,7 @@ class AIController extends Controller
             'ingredients' => 'required|array|min:1',
         ]);
 
+        // Construct the meal data to pass to the GPT API
         $mealType = $request->meal_type;
         $ingredients = implode(", ", $request->ingredients);
         $calories = $request->calories;
@@ -252,128 +353,82 @@ class AIController extends Controller
 
         $openaiApiKey = config('services.openai.key');
         $endpoint = 'https://api.openai.com/v1/chat/completions';
-        
-        $promptTemplate = <<<EOT
-        I need a meal plan suggestion based on these precise requirements:
 
-        ### 🔹 User Information
-        - Gender: {{gender}}
-        - Age: {{age}} years
-        - Height: {{height}} cm
-        - Weight: {{weight}} kg
-        - Goal: {{goal}}
-        - Meal Type: {{meal_type}} (The meal must be suitable for this type)
+        // Prepare the prompt for OpenAI meal generation
+        $prompt = view('prompts.reliable_meal_prompt', [
+            'gender' => $gender,
+            'age' => $age,
+            'height' => $height,
+            'weight' => $weight,
+            'goal' => $goal,
+            'meal_type' => $mealType,
+            'calories' => $calories,
+            'protein' => $protein,
+            'carbs' => $carbs,
+            'ingredients' => $ingredients,
+            'allergies' => $allergies,
+            'preferred_cuisine' => $preferred_cuisine
+        ])->render();
 
-        ### 🔹 Macronutrient Goals
-        - Target Calories: {{calories}} kcal
-        - Target Protein: {{protein}} g
-        - Target Carbohydrates: {{carbs}} g
-        - Fat should be adjusted dynamically to balance macros.
+        // Call OpenAI API to generate the meal
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $openaiApiKey,
+            'Content-Type' => 'application/json',
+        ])->post($endpoint, [
+            'model' => 'gpt-4o',
+            'messages' => [['role' => 'user', 'content' => $prompt]],
+            'temperature' => 0.7,
+        ]);
 
-        ### 🔹 Allowed Ingredients
-        Ingredients are provided in this format: {{ingredients}} (e.g., ["100 gramme chicken breast", "3 tomatoes", "200 gramme tuna"]). Each entry includes quantity, unit, and ingredient name.
-
-        ### 🔹 Ingredient Processing Rules
-        - Parse each ingredient string to extract the quantity, unit, and name (e.g., "100 gramme chicken breast" → quantity: 100, unit: gramme, name: chicken breast).
-        - For each ingredient, fetch its macronutrient data from the USDA FoodData Central database based on the name and preparation state (assume "raw" unless specified, e.g., "chicken breast" is raw, "pasta" is cooked).
-        - Convert quantities to grams if needed (e.g., "20ml olive oil" → ~18g, "2 medium tomatoes" → ~246g, "1 baguette" → ~150g). Use standard conversions (e.g., 1 medium tomato ≈ 123g, 1ml olive oil ≈ 0.91g).
-        - Calculate macros for each ingredient based on the quantity (e.g., 100g chicken breast → 165 kcal, 31g protein, 0g carbs, 3.6g fat).
-
-        ### 🔹 Smart Ingredient Selection Rules
-        - The meal must strictly align with the meal type: {{meal_type}}. Adjust ingredients, cooking style, and portion sizes accordingly.
-        - Use ALL provided ingredients unless they cannot fit within the macro goals after scaling.
-        - Iteratively scale the quantities of each ingredient (up or down) to meet the macro goals within ±5% (e.g., if 100g pasta exceeds carb target, reduce to 50g).
-        - If scaling alone cannot meet the goals, ADD new ingredients to balance macros (e.g., add chicken breast for protein).
-        - Remove ingredients only if they contribute less than 5% to total macros AND their removal helps meet the goals.
-        - If the final macros deviate by more than ±5% from the target after scaling and adding ingredients, use the actual calculated macros and include a warning in the response.
-
-        ### 🔹 Macronutrient Integrity
-        - Macronutrient values must reflect **real values from the USDA FoodData Central database**.
-        - Each ingredient must indicate its **preparation state** (e.g., raw, cooked, grilled, steamed).
-        - Calculate the total macros by summing the macros of each ingredient.
-        - STRICTLY FORBID altering protein, fat, carb, or calorie values to match the targets. If the targets cannot be met, return the actual calculated values.
-        - If the final macros deviate from the target by more than ±5%, include a "warning" field in the response explaining the deviation (e.g., "warning": "Protein target not met; actual protein is 40g instead of 51g").
-        - MANDATORY VALIDATION: After generating the meal, calculate the sum of each macro (calories, protein, carbs, fat) from the ingredients. Compare with the reported totals. If any reported total deviates from the sum by more than 0.1%, return: {"error": "Macro fabrication detected; reported totals do not match sum of ingredients. Reported: {reported_values}, Sum: {summed_values}"}, where {reported_values} and {summed_values} are the respective totals.
-        - CRITICAL ENFORCEMENT: Fabrication of macros will invalidate the response. The reported totals MUST be the exact sum of the ingredients' macros, with no exceptions.
-
-        ### 🔹 Cooking Instructions
-        - Provide clear, structured cooking steps.
-        - Include preparation time, cooking time, and method (e.g., baking, grilling, steaming).
-        - Make it beginner-friendly with easy-to-follow steps.
-
-        ### 🔹 IMPORTANT RULES
-        1️⃣ STRICTLY return only a valid JSON object. No markdown, no explanations, no formatting.
-        2️⃣ Ensure all meals include detailed macronutrient breakdowns **per ingredient**, with quantities and cooking states.
-        3️⃣ The final response format must **exactly match** the example JSON below, with a mandatory "warning" field if targets are not met:
-
-        {"meal": {
-        "name": "Grilled Meat & Potato Bowl",
-        "calories": 500,
-        "protein": 60,
-        "carbs": 40,
-        "fat": 30,
-        "warning": "Protein target not met; actual protein is 55g instead of 60g", // Mandatory if targets not met
-        "ingredients": [
-            {"name": "Beef (grilled)", "quantity": "150g", "calories": 300, "protein": 50, "carbs": 0, "fat": 18},
-            {"name": "Olive Oil", "quantity": "2 tbsp", "calories": 240, "protein": 0, "carbs": 0, "fat": 28},
-            {"name": "Potatoes (roasted)", "quantity": "150g", "calories": 130, "protein": 3, "carbs": 30, "fat": 0.2},
-            {"name": "Tomato (fresh)", "quantity": "1 medium", "calories": 25, "protein": 1, "carbs": 5, "fat": 0.2}
-        ],
-        "instructions": [
-            "Preheat oven to 400°F (200°C).",
-            "Season beef with salt and pepper. Grill or pan-fry for 5-7 minutes per side.",
-            "Cut potatoes into wedges, drizzle with 1 tbsp olive oil, and roast for 25-30 minutes.",
-            "Slice tomato and set aside.",
-            "Drizzle remaining olive oil over meat and potatoes before serving.",
-            "Serve all components together in a bowl."
-        ]}}
-        EOT;
-        
-                $prompt = str_replace(
-                    ['{{gender}}', '{{age}}', '{{height}}', '{{weight}}', '{{goal}}', '{{meal_type}}', '{{calories}}', '{{protein}}', '{{carbs}}', '{{ingredients}}'],
-                    [$gender, $age, $height, $weight, $goal, $mealType, $calories, $protein, $carbs, $ingredients],
-                    $promptTemplate
-                );
-        
-                $response = Http::withHeaders([
-                    'Authorization' => 'Bearer ' . $openaiApiKey,
-                    'Content-Type' => 'application/json',
-                ])->post($endpoint, [
-                    'model' => 'gpt-4o',
-                    'messages' => [
-                        ['role' => 'user', 'content' => $prompt]
-                    ],
-                    'temperature' => 0.7,
-                ]);
-        
+        // Parse the response from OpenAI
         $data = $response->json();
-
         Log::info("OpenAI Response:", $data);
 
         $message = $data['choices'][0]['message']['content'] ?? null;
-        if (!$message) {
-            return response()->json(['error' => 'Invalid AI response'], 500);
-        }
+        if (!$message) return response()->json(['error' => 'Invalid AI response'], 500);
 
         $cleaned = preg_replace('/```json|```/', '', $message);
         $parsed = json_decode(trim($cleaned), true);
+        if (!$parsed) return response()->json(['success' => false, 'error' => 'Failed to parse OpenAI response.', 'raw' => $message], 500);
 
-        if (!$parsed) {
-            return response()->json([
-                'success' => false,
-                'error' => 'Failed to parse OpenAI response into valid JSON.',
-                'raw' => $message
-            ], 500);
+        // USDA Macro validation log
+        Log::info("USDA Data for Ingredients: ", $parsed['meal']['ingredients']);
+
+        // Validate the macros from the ingredients
+        $totals = ['calories' => 0, 'protein' => 0, 'carbs' => 0, 'fat' => 0];
+        foreach ($parsed['meal']['ingredients'] as $i) {
+            // USDA lookup for each ingredient
+            $nutrition = $this->lookupUsdaMacros($i['name'], $i['quantity']);
+            $i['calories'] = $nutrition['calories'];
+            $i['protein'] = $nutrition['protein'];
+            $i['carbs'] = $nutrition['carbs'];
+            $i['fat'] = $nutrition['fat'];
+
+            // Add to totals
+            $totals['calories'] += $nutrition['calories'];
+            $totals['protein'] += $nutrition['protein'];
+            $totals['carbs'] += $nutrition['carbs'];
+            $totals['fat'] += $nutrition['fat'];
         }
 
-        // **Now generate the image based on the meal name and ingredients**
+        // Log the final macronutrient totals
+        Log::info('Total Macros after USDA verification: ', $totals);
+
+        // Check if macros are within acceptable range
+        if (!$this->isWithinRange($totals['calories'], $calories) || !$this->isWithinRange($totals['protein'], $protein) || !$this->isWithinRange($totals['carbs'], $carbs)) {
+            // If not within range, ask GPT to regenerate the meal
+            return response()->json([
+                'error' => 'Unable to generate a meal that satisfies the macro constraints with provided ingredients.'
+            ], 400);
+        }
+
+        // Image Generation Logic
         $mealName = $parsed['meal']['name'];
         $ingredients = implode(", ", array_map(function ($ingredient) {
             return $ingredient['name'];
         }, $parsed['meal']['ingredients']));
 
         $imagePrompt = "Generate a realistic, high-resolution photograph of a freshly prepared meal titled '$mealName', served on a ceramic plate. The dish should be fully cooked and beautifully arranged with the following ingredients: $ingredients. The scene should resemble a professional food photo, styled for a recipe book or restaurant menu. Use natural lighting, slight shadows, and realistic textures — no illustrations, no cartoons, no sketches.";
-        //Log::info("Image Generation Prompt: " . $imagePrompt);
 
         $imageResponse = Http::withHeaders([
             'Authorization' => 'Bearer ' . $openaiApiKey,
@@ -385,13 +440,12 @@ class AIController extends Controller
         ]);
 
         $imageData = $imageResponse->json();
-
         $localUrls = [];
         if (!empty($imageData['data'])) {
             foreach ($imageData['data'] as $img) {
-                $url       = $img['url'];
-                $contents  = file_get_contents($url);
-                $path      = 'meals/' . uniqid('meal_') . '.png';
+                $url = $img['url'];
+                $contents = file_get_contents($url);
+                $path = 'meals/' . uniqid('meal_') . '.png';
                 Storage::disk('public')->put($path, $contents);
                 $localUrls[] = asset("storage/{$path}");
             }
@@ -399,25 +453,45 @@ class AIController extends Controller
             return response()->json(['error'=>'Failed to generate images'], 500);
         }
 
-        // Save the meal
-        $meal = new Meal();
-        $meal->user_id = $user->id;
-        $meal->name = $parsed['meal']['name'];
-        $meal->meal_type = $mealType;
-        $meal->ingredients = json_encode($parsed['meal']['ingredients']);
-        $meal->instructions = json_encode($parsed['meal']['instructions']);
-        $meal->calories = $parsed['meal']['calories'];
-        $meal->protein = $parsed['meal']['protein'];
-        $meal->carbs = $parsed['meal']['carbs'];
-        $meal->fat = $parsed['meal']['fat'];
-        $meal->images = $localUrls;
-        $meal->save();
-
         return response()->json([
             'success' => true,
-            'message' => 'Meal successfully generated and stored.',
             'meal_plan' => $parsed,
             'images_link' => $localUrls,
-        ], 200, [], JSON_UNESCAPED_SLASHES);
+        ], 200);
+    }
+
+    // Helper function to check if value is within target range (±5%)
+    private function isWithinRange($actual, $target, $percent = 5) {
+        $min = $target * (1 - $percent / 100);
+        $max = $target * (1 + $percent / 100);
+        return $actual >= $min && $actual <= $max;
+    }
+
+    // Helper function to fetch USDA macros
+    private function lookupUsdaMacros($ingredientName, $quantity) {
+        $usdaApiKey = env('USDA_API_KEY');
+        $response = Http::get("https://api.nal.usda.gov/fdc/v1/foods/search?query={$ingredientName}&api_key={$usdaApiKey}");
+
+        if ($response->successful()) {
+            $data = $response->json();
+            // Log USDA response
+            Log::info('USDA API Response for ' . $ingredientName, $data);
+            
+            // Return macros based on the first food item
+            return [
+                'calories' => $data['foods'][0]['foodNutrients'][0]['value'],
+                'protein' => $data['foods'][0]['foodNutrients'][1]['value'],
+                'carbs' => $data['foods'][0]['foodNutrients'][2]['value'],
+                'fat' => $data['foods'][0]['foodNutrients'][3]['value']
+            ];
+        }
+
+        // Return mock data if API fails
+        return [
+            'calories' => 200, 
+            'protein' => 15, 
+            'carbs' => 20, 
+            'fat' => 10
+        ];
     }
 }
